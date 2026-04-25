@@ -298,8 +298,8 @@ mongoose
     "mongodb+srv://sharik:O8hu92ELD8gflCSd@cluster0.vbdcynq.mongodb.net/all-data?appName=Cluster0",
   )
   .then(() => {
-    server.listen(port, () => {
-      console.log(`🚀 Sharik server running at http://localhost:${port}`);
+    server.listen(port, "0.0.0.0", () => {
+      console.log(`🚀 Sharik server running on port ${port}`);
     });
   })
   .catch((err) => {
