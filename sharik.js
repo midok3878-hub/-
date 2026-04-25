@@ -8,7 +8,8 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const app = express();
-const port = process.env.PORT || 3000;
+// Force port 3000 because Railway Target Port is set to 3000
+const port = 3000;
 const mongoose = require("mongoose");
 const http = require("http");
 const server = http.createServer(app);
