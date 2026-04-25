@@ -293,15 +293,18 @@ io.on("connection", (socket) => {
 // ═══════════════════════════════════════════════
 // MongoDB Connection & Server Start
 // ═══════════════════════════════════════════════
+// Start server first so Railway doesn't timeout
+server.listen(port, "0.0.0.0", () => {
+  console.log(`🚀 Sharik server running on port ${port}`);
+});
+
 mongoose
   .connect(
-    "mongodb+srv://sharik:O8hu92ELD8gflCSd@cluster0.vbdcynq.mongodb.net/all-data?appName=Cluster0",
+    "mongodb+srv://sharik:O8hu92ELD8gflCSd@cluster0.vbdcynq.mongodb.net/all-data?appName=Cluster0"
   )
   .then(() => {
-    server.listen(port, "0.0.0.0", () => {
-      console.log(`🚀 Sharik server running on port ${port}`);
-    });
+    console.log("✅ Connected to MongoDB");
   })
   .catch((err) => {
-    console.log(err);
+    console.error("❌ MongoDB Connection Error:", err.message);
   });
