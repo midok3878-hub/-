@@ -180,20 +180,29 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
 
     const allUsers = await User.find({
       _id: { $ne: currentUser._id },
-      learnSkills: { $exists: true, $not: { $size: 0 } },
-      teachSkills: { $exists: true, $not: { $size: 0 } },
-      verifiedSkills: { $exists: true, $not: { $size: 0 } },
+      learnSkills: { $exists: true, $ne: [] },
+      teachSkills: { $exists: true, $ne: [] },
+      verifiedSkills: { $exists: true, $ne: [] },
     });
 
     const matches = allUsers
       .filter((user) => {
-        const canTeachMe = user.teachSkills.some((s) => currentUser.learnSkills.includes(s));
-        const canLearnFrom = user.learnSkills.some((s) => currentUser.teachSkills.includes(s));
+        // يجب أن يمتلك المستخدم الآخر المهارة التي أريد تعلمها، وأن يكون قد اجتاز اختبارها
+        const canTeachMe = user.teachSkills.some((s) => 
+          currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)
+        );
+        
+        // يجب أن أمتلك أنا المهارة التي يريد المستخدم الآخر تعلمها، وأن أكون قد اجتزت اختبارها
+        const canLearnFrom = user.learnSkills.some((s) => 
+          currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)
+        );
+        
+        // المطابقة تتم فقط إذا كان هناك تبادل منفعة (كل شخص يفيد الآخر)
         return canTeachMe && canLearnFrom;
       })
       .map((user) => {
-        const learnM = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s)).length;
-        const teachM = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s)).length;
+        const learnM = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)).length;
+        const teachM = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)).length;
         const total = currentUser.learnSkills.length + currentUser.teachSkills.length || 1;
         const matchScore = Math.round(((learnM + teachM) / total) * 100);
         const safe = user.toSafeObject();
