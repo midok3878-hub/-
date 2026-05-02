@@ -113,6 +113,28 @@ app.get("/api/me", authMiddleware, async (req, res) => {
   }
 });
 
+// Update avatar (base64)
+app.put("/api/me/avatar", authMiddleware, async (req, res) => {
+  try {
+    const { avatar } = req.body;
+    if (!avatar) return res.status(400).json({ error: "الصورة مطلوبة" });
+    // Limit to ~2MB base64
+    if (avatar.length > 2.8 * 1024 * 1024) {
+      return res.status(413).json({ error: "حجم الصورة كبير جداً (الحد الأقصى 2MB)" });
+    }
+    const user = await User.findByIdAndUpdate(
+      req.userId,
+      { avatar },
+      { new: true }
+    );
+    const safeUser = user.toSafeObject();
+    safeUser.name = safeUser.username1 + " " + safeUser.username2;
+    res.json({ user: safeUser });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في تحديث الصورة" });
+  }
+});
+
 // ═══════════════════════════════════════════════
 // 2) SKILLS APIs - Save skills
 // ═══════════════════════════════════════════════
