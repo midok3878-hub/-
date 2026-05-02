@@ -35,6 +35,12 @@ app.use(cors());
 const User = require("./modules/User");
 const Message = require("./modules/Message");
 const Article = require("./modules/myData");
+const path = require("path");
+
+// ═══════════════════════════════════════════════
+// Serve Static Frontend
+// ═══════════════════════════════════════════════
+app.use(express.static(path.join(__dirname, "../public")));
 
 // ═══════════════════════════════════════════════
 // JWT Auth Middleware
