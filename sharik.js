@@ -14,7 +14,13 @@ const mongoose = require("mongoose");
 const http = require("http");
 const server = http.createServer(app);
 const { Server } = require("socket.io");
-const io = new Server(server);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  maxHttpBufferSize: 30e6 // 30 MB
+});
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
