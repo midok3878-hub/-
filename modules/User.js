@@ -27,6 +27,17 @@ const userSchema = new Schema(
       },
       default: {},
     },
+    bio: { type: String, default: "مطور ويب شغوف بالتعلم ومشاركة المعرفة. أحب العمل على المشاريع التقنية وأسعى دائماً لتطوير مهاراتي." },
+    deletedConnections: { type: [String], default: [] },
+    reviews: [
+      {
+        reviewerEmail: String,
+        reviewerName: String,
+        rating: Number,
+        comment: String,
+        date: { type: Date, default: Date.now }
+      }
+    ]
   },
   { timestamps: true }
 );

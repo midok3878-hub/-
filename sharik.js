@@ -303,6 +303,109 @@ app.get("/api/user/:email", authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
+// 6) PROFILE EXTENSIONS APIs (Interactions, Reviews, Bio)
+// ═══════════════════════════════════════════════
+
+// Update Bio
+app.put("/api/me/bio", authMiddleware, async (req, res) => {
+  try {
+    const { bio } = req.body;
+    const user = await User.findByIdAndUpdate(req.userId, { bio }, { new: true });
+    const safeUser = user.toSafeObject();
+    safeUser.name = safeUser.username1 + " " + safeUser.username2;
+    res.json({ user: safeUser });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في تحديث النبذة" });
+  }
+});
+
+// Get users interacted with (matches or chatted)
+app.get("/api/interactions", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.userId);
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+    // Find all users currentUser has chatted with
+    const messages = await Message.find({
+      $or: [{ sender: currentUser.email }, { receiver: currentUser.email }]
+    });
+
+    const interactedEmails = new Set();
+    messages.forEach(msg => {
+      if (msg.sender !== currentUser.email) interactedEmails.add(msg.sender);
+      if (msg.receiver !== currentUser.email) interactedEmails.add(msg.receiver);
+    });
+
+    // Remove deleted connections
+    const deleted = new Set(currentUser.deletedConnections || []);
+    const validEmails = Array.from(interactedEmails).filter(e => !deleted.has(e));
+
+    const users = await User.find({ email: { $in: validEmails } });
+    const safeUsers = users.map(u => {
+      const s = u.toSafeObject();
+      s.name = s.username1 + " " + s.username2;
+      return s;
+    });
+
+    res.json({ interactions: safeUsers });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب التفاعلات" });
+  }
+});
+
+// Delete a connection
+app.post("/api/connections/delete", authMiddleware, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "البريد الإلكتروني مطلوب" });
+
+    await User.findByIdAndUpdate(req.userId, {
+      $addToSet: { deletedConnections: email }
+    });
+    
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في حذف الاتصال" });
+  }
+});
+
+// Add a review
+app.post("/api/reviews", authMiddleware, async (req, res) => {
+  try {
+    const { targetEmail, rating, comment } = req.body;
+    if (!targetEmail || !rating) return res.status(400).json({ error: "البيانات مطلوبة" });
+
+    const reviewer = await User.findById(req.userId);
+    if (!reviewer) return res.status(404).json({ error: "المراجع غير موجود" });
+
+    const targetUser = await User.findOne({ email: targetEmail });
+    if (!targetUser) return res.status(404).json({ error: "المستخدم المستهدف غير موجود" });
+
+    // Check if review already exists
+    const existingReviewIndex = targetUser.reviews.findIndex(r => r.reviewerEmail === reviewer.email);
+    const newReview = {
+      reviewerEmail: reviewer.email,
+      reviewerName: reviewer.username1 + " " + reviewer.username2,
+      rating: Number(rating),
+      comment: comment || "",
+      date: new Date()
+    };
+
+    if (existingReviewIndex >= 0) {
+      targetUser.reviews[existingReviewIndex] = newReview;
+    } else {
+      targetUser.reviews.push(newReview);
+    }
+
+    await targetUser.save();
+    res.json({ success: true, reviews: targetUser.reviews });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في إضافة التقييم" });
+  }
+});
+
+
+// ═══════════════════════════════════════════════
 // SOCKET.IO - Real-time Chat
 // ═══════════════════════════════════════════════
 io.on("connection", (socket) => {
