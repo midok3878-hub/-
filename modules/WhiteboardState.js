@@ -30,6 +30,8 @@ const whiteboardStateSchema = new Schema(
       activeTemplate: { type: String, default: "blank" },
       recordingActive: { type: Boolean, default: false },
       recordingStartedAt: { type: Date, default: null },
+      roleModeActive: { type: Boolean, default: false },
+      lockExpiresAt: { type: Date, default: null },
     },
     assets: {
       type: [

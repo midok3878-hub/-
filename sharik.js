@@ -59,10 +59,13 @@ const crypto = require("crypto");
 const WHITEBOARD_SNAPSHOT_INTERVAL = 25;
 const WHITEBOARD_MAX_ACTIONS = 140;
 const WHITEBOARD_MAX_RECORDING_EVENTS = 5000;
+const WHITEBOARD_LOCK_DURATION_MS = 10 * 60 * 1000;
 const METRICS_LOG_INTERVAL_MS = 60000;
 const REDIS_RETRY_ATTEMPTS = 5;
 const EVENT_QUEUE_MAX = Number(process.env.EVENT_QUEUE_MAX || 400);
 const eventQueues = new Map();
+const whiteboardPendingApprovals = new Map();
+const whiteboardLockTimers = new Map();
 const metrics = {
   socketEvents: {},
   rateLimited: {},
@@ -191,6 +194,8 @@ function ensureSessionMeta(state = {}, chatId = "") {
       activeTemplate: "blank",
       recordingActive: false,
       recordingStartedAt: null,
+      roleModeActive: false,
+      lockExpiresAt: null,
     };
   }
   if (!state.sessionMeta.permissions || typeof state.sessionMeta.permissions !== "object") {
@@ -202,9 +207,7 @@ function ensureSessionMeta(state = {}, chatId = "") {
   const members = parseChatMembers(chatId);
   if (members.length >= 2) {
     const [memberA, memberB] = members;
-    if (!state.sessionMeta.teacher) state.sessionMeta.teacher = memberA;
-    if (!state.sessionMeta.learner) state.sessionMeta.learner = memberB;
-    if (!state.sessionMeta.permissions[memberA]) state.sessionMeta.permissions[memberA] = defaultPermission(true);
+    if (!state.sessionMeta.permissions[memberA]) state.sessionMeta.permissions[memberA] = defaultPermission(false);
     if (!state.sessionMeta.permissions[memberB]) state.sessionMeta.permissions[memberB] = defaultPermission(false);
   }
   return state;
@@ -223,10 +226,56 @@ function canControlSession(state, email) {
 
 function canUserDraw(state, email) {
   const userEmail = normalizeSessionEmail(email);
-  if (state?.sessionMeta?.boardLocked && !canControlSession(state, userEmail)) return false;
+  if (state?.sessionMeta?.boardLocked) {
+    const teacher = normalizeSessionEmail(state?.sessionMeta?.teacher);
+    return teacher && userEmail === teacher;
+  }
   const permission = state?.sessionMeta?.permissions?.[userEmail];
   if (!permission) return true;
   return Boolean(permission.canDraw);
+}
+
+function getPeerEmail(chatId, email) {
+  const members = parseChatMembers(chatId);
+  const current = normalizeSessionEmail(email);
+  return members.find((m) => m !== current) || "";
+}
+
+function getApprovalState(chatId) {
+  if (!whiteboardPendingApprovals.has(chatId)) {
+    whiteboardPendingApprovals.set(chatId, { role: null, lock: null });
+  }
+  return whiteboardPendingApprovals.get(chatId);
+}
+
+function clearLockTimer(chatId) {
+  const timer = whiteboardLockTimers.get(chatId);
+  if (timer) clearTimeout(timer);
+  whiteboardLockTimers.delete(chatId);
+}
+
+function scheduleLockExpiry(chatId) {
+  clearLockTimer(chatId);
+  const timer = setTimeout(async () => {
+    const state = await loadWhiteboardState(chatId);
+    ensureSessionMeta(state, chatId);
+    state.sessionMeta.boardLocked = false;
+    state.sessionMeta.lockExpiresAt = null;
+    state.sessionMeta.roleModeActive = false;
+    state.sessionMeta.teacher = "";
+    state.sessionMeta.learner = "";
+    whiteboardStates.set(chatId, state);
+    queueWhiteboardPersist(chatId);
+    io.to(chatId).emit("whiteboardLockExpired", {
+      chatId,
+      sessionMeta: state.sessionMeta,
+    });
+    io.to(chatId).emit("whiteboardSession", {
+      chatId,
+      sessionMeta: state.sessionMeta,
+    });
+  }, WHITEBOARD_LOCK_DURATION_MS);
+  whiteboardLockTimers.set(chatId, timer);
 }
 
 function appendRecordingEvent(state, eventName, sender, payload = {}) {
@@ -1089,29 +1138,103 @@ io.on("connection", (socket) => {
     }
     const preState = await loadWhiteboardState(payload.chatId);
     ensureSessionMeta(preState, payload.chatId);
-    if (!canControlSession(preState, socket.user.email)) {
-      ackErr(ack, traceId, "CONTROL_FORBIDDEN", "control_forbidden");
-      endEvent("whiteboardControl", startedAt, traceId);
-      return;
-    }
     const enqueued = enqueueChatTask(payload.chatId, async () => {
       const state = await loadWhiteboardState(payload.chatId);
       ensureSessionMeta(state, payload.chatId);
       const action = payload.action || "";
       const target = normalizeSessionEmail(payload.targetEmail);
-      if (action === "setRole" && target && (payload.role === "teacher" || payload.role === "learner")) {
+      const approvals = getApprovalState(payload.chatId);
+
+      if (action === "requestRoleMode") {
+        const requestId = String(payload.requestId || genTraceId());
+        const targetEmail = target || getPeerEmail(payload.chatId, socket.user.email);
+        if (!targetEmail) return;
+        approvals.role = {
+          requestId,
+          requester: normalizeSessionEmail(socket.user.email),
+          target: targetEmail,
+          createdAt: Date.now(),
+        };
+        io.to(payload.chatId).emit("whiteboardRoleProposal", {
+          chatId: payload.chatId,
+          requestId,
+          requester: socket.user.email,
+          requesterName: payload.requesterName || socket.user.email,
+          target: targetEmail,
+          traceId,
+        });
+      } else if (action === "respondRoleMode") {
+        const req = approvals.role;
+        if (!req || req.requestId !== payload.requestId) return;
+        if (normalizeSessionEmail(socket.user.email) !== req.target) return;
+        if (payload.approved) {
+          state.sessionMeta.roleModeActive = true;
+          state.sessionMeta.teacher = req.requester;
+          state.sessionMeta.learner = req.target;
+        } else {
+          state.sessionMeta.roleModeActive = false;
+          state.sessionMeta.teacher = "";
+          state.sessionMeta.learner = "";
+        }
+        approvals.role = null;
+      } else if (action === "requestLock") {
+        if (!state.sessionMeta.roleModeActive) return;
+        const requestId = String(payload.requestId || genTraceId());
+        const targetEmail = target || getPeerEmail(payload.chatId, socket.user.email);
+        if (!targetEmail) return;
+        approvals.lock = {
+          requestId,
+          requester: normalizeSessionEmail(socket.user.email),
+          target: targetEmail,
+          createdAt: Date.now(),
+        };
+        io.to(payload.chatId).emit("whiteboardLockProposal", {
+          chatId: payload.chatId,
+          requestId,
+          requester: socket.user.email,
+          requesterName: payload.requesterName || socket.user.email,
+          target: targetEmail,
+          durationMs: WHITEBOARD_LOCK_DURATION_MS,
+          traceId,
+        });
+      } else if (action === "respondLock") {
+        const req = approvals.lock;
+        if (!req || req.requestId !== payload.requestId) return;
+        if (normalizeSessionEmail(socket.user.email) !== req.target) return;
+        if (payload.approved) {
+          state.sessionMeta.boardLocked = true;
+          state.sessionMeta.lockExpiresAt = new Date(Date.now() + WHITEBOARD_LOCK_DURATION_MS);
+          scheduleLockExpiry(payload.chatId);
+        }
+        approvals.lock = null;
+      } else if (action === "clearRoleMode") {
+        if (normalizeSessionEmail(socket.user.email) !== normalizeSessionEmail(state.sessionMeta.teacher)) return;
+        state.sessionMeta.roleModeActive = false;
+        state.sessionMeta.teacher = "";
+        state.sessionMeta.learner = "";
+        state.sessionMeta.boardLocked = false;
+        state.sessionMeta.lockExpiresAt = null;
+        clearLockTimer(payload.chatId);
+      } else if (action === "setRole" && target && (payload.role === "teacher" || payload.role === "learner")) {
         state.sessionMeta[payload.role] = target;
       } else if (action === "setPermission" && target) {
+        if (!canControlSession(state, socket.user.email)) return;
         const current = state.sessionMeta.permissions[target] || defaultPermission(false);
         state.sessionMeta.permissions[target] = {
           ...current,
           ...payload.permission,
         };
       } else if (action === "lockBoard") {
+        if (!canControlSession(state, socket.user.email)) return;
         state.sessionMeta.boardLocked = Boolean(payload.locked);
+        state.sessionMeta.lockExpiresAt = state.sessionMeta.boardLocked ? new Date(Date.now() + WHITEBOARD_LOCK_DURATION_MS) : null;
+        if (state.sessionMeta.boardLocked) scheduleLockExpiry(payload.chatId);
+        else clearLockTimer(payload.chatId);
       } else if (action === "followMode") {
+        if (!canControlSession(state, socket.user.email)) return;
         state.sessionMeta.followMode = Boolean(payload.enabled);
       } else if (action === "kick" && target) {
+        if (!canControlSession(state, socket.user.email)) return;
         io.to(payload.chatId).emit("whiteboardControl", {
           chatId: payload.chatId,
           action: "kicked",
@@ -1166,7 +1289,8 @@ io.on("connection", (socket) => {
         type: asset.type === "pdf-page" ? "pdf-page" : "image",
         name: String(asset.name || ""),
         mime: String(asset.mime || ""),
-        key: String(asset.data || ""),
+        key: String(asset.key || asset.data || ""),
+        data: String(asset.data || asset.key || ""),
         page: Number(asset.page) || 1,
         width: Number(asset.width) || 0,
         height: Number(asset.height) || 0,
