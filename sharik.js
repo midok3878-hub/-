@@ -58,6 +58,7 @@ const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
 const WHITEBOARD_SNAPSHOT_INTERVAL = 25;
 const WHITEBOARD_MAX_ACTIONS = 140;
+const WHITEBOARD_MAX_RECORDING_EVENTS = 5000;
 const METRICS_LOG_INTERVAL_MS = 60000;
 const REDIS_RETRY_ATTEMPTS = 5;
 const EVENT_QUEUE_MAX = Number(process.env.EVENT_QUEUE_MAX || 400);
@@ -170,6 +171,79 @@ function sanitizeAction(action) {
   return null;
 }
 
+function defaultPermission(canControl = false) {
+  return {
+    canDraw: true,
+    canUseText: true,
+    canUpload: true,
+    canControl,
+  };
+}
+
+function ensureSessionMeta(state = {}, chatId = "") {
+  if (!state.sessionMeta || typeof state.sessionMeta !== "object") {
+    state.sessionMeta = {
+      teacher: "",
+      learner: "",
+      permissions: {},
+      boardLocked: false,
+      followMode: false,
+      activeTemplate: "blank",
+      recordingActive: false,
+      recordingStartedAt: null,
+    };
+  }
+  if (!state.sessionMeta.permissions || typeof state.sessionMeta.permissions !== "object") {
+    state.sessionMeta.permissions = {};
+  }
+  if (!state.assets || !Array.isArray(state.assets)) state.assets = [];
+  if (!state.recordingLog || !Array.isArray(state.recordingLog)) state.recordingLog = [];
+
+  const members = parseChatMembers(chatId);
+  if (members.length >= 2) {
+    const [memberA, memberB] = members;
+    if (!state.sessionMeta.teacher) state.sessionMeta.teacher = memberA;
+    if (!state.sessionMeta.learner) state.sessionMeta.learner = memberB;
+    if (!state.sessionMeta.permissions[memberA]) state.sessionMeta.permissions[memberA] = defaultPermission(true);
+    if (!state.sessionMeta.permissions[memberB]) state.sessionMeta.permissions[memberB] = defaultPermission(false);
+  }
+  return state;
+}
+
+function normalizeSessionEmail(email = "") {
+  return String(email || "").trim().toLowerCase();
+}
+
+function canControlSession(state, email) {
+  const userEmail = normalizeSessionEmail(email);
+  const teacher = normalizeSessionEmail(state?.sessionMeta?.teacher);
+  if (teacher && teacher === userEmail) return true;
+  return Boolean(state?.sessionMeta?.permissions?.[userEmail]?.canControl);
+}
+
+function canUserDraw(state, email) {
+  const userEmail = normalizeSessionEmail(email);
+  if (state?.sessionMeta?.boardLocked && !canControlSession(state, userEmail)) return false;
+  const permission = state?.sessionMeta?.permissions?.[userEmail];
+  if (!permission) return true;
+  return Boolean(permission.canDraw);
+}
+
+function appendRecordingEvent(state, eventName, sender, payload = {}) {
+  ensureSessionMeta(state);
+  const shouldRecord = state.sessionMeta.recordingActive || eventName.startsWith("recording:");
+  if (!shouldRecord) return;
+  state.recordingLog.push({
+    ts: Date.now(),
+    event: eventName,
+    sender: normalizeSessionEmail(sender),
+    payload,
+  });
+  if (state.recordingLog.length > WHITEBOARD_MAX_RECORDING_EVENTS) {
+    state.recordingLog = state.recordingLog.slice(-WHITEBOARD_MAX_RECORDING_EVENTS);
+  }
+}
+
 async function initRedisAdapterIfEnabled() {
   const redisUrl = process.env.REDIS_URL;
   if (!redisUrl) return;
@@ -219,8 +293,12 @@ async function loadWhiteboardState(chatId) {
         snapshot,
         actions: doc.actions || [],
         redoStack: doc.redoStack || [],
+        sessionMeta: doc.sessionMeta || {},
+        assets: doc.assets || [],
+        recordingLog: doc.recordingLog || [],
       }
-    : { snapshot: null, actions: [], redoStack: [] };
+    : { snapshot: null, actions: [], redoStack: [], sessionMeta: {}, assets: [], recordingLog: [] };
+  ensureSessionMeta(state, chatId);
   whiteboardStates.set(chatId, state);
   return state;
 }
@@ -230,7 +308,8 @@ function queueWhiteboardPersist(chatId) {
   const existing = whiteboardPersistTimers.get(chatId);
   if (existing) clearTimeout(existing);
   const timer = setTimeout(async () => {
-    const state = whiteboardStates.get(chatId) || { snapshot: null, actions: [], redoStack: [] };
+    const state = whiteboardStates.get(chatId) || { snapshot: null, actions: [], redoStack: [], sessionMeta: {}, assets: [], recordingLog: [] };
+    ensureSessionMeta(state, chatId);
     try {
       let snapshotKey = "";
       if (state.snapshot?.data) {
@@ -250,6 +329,9 @@ function queueWhiteboardPersist(chatId) {
             : { mime: "", key: "", updatedAt: null },
           actions: state.actions,
           redoStack: state.redoStack,
+          sessionMeta: state.sessionMeta,
+          assets: state.assets,
+          recordingLog: state.recordingLog,
         },
         { upsert: true, new: true }
       );
@@ -731,6 +813,9 @@ io.on("connection", (socket) => {
       chatId,
       snapshot: state.snapshot || null,
       actions: state.actions,
+      sessionMeta: state.sessionMeta,
+      assets: state.assets,
+      recordingLog: state.recordingLog,
     });
     ackOk(ack, traceId);
     endEvent("joinChat", startedAt, traceId);
@@ -798,6 +883,9 @@ io.on("connection", (socket) => {
       chatId,
       snapshot: state.snapshot || null,
       actions: state.actions,
+      sessionMeta: state.sessionMeta,
+      assets: state.assets,
+      recordingLog: state.recordingLog,
     });
     ackOk(ack, traceId);
     endEvent("requestWhiteboardState", startedAt, traceId);
@@ -824,8 +912,11 @@ io.on("connection", (socket) => {
     }
     const enqueued = enqueueChatTask(chatId, async () => {
       const state = await loadWhiteboardState(chatId);
+      ensureSessionMeta(state, chatId);
+      if (!canUserDraw(state, socket.user.email)) return;
       state.actions.push(safeAction);
       state.redoStack = [];
+      appendRecordingEvent(state, "action", socket.user.email, { action: safeAction });
       if (state.actions.length % WHITEBOARD_SNAPSHOT_INTERVAL === 0) {
         state.snapshot = null;
         if (state.actions.length > WHITEBOARD_MAX_ACTIONS) {
@@ -891,6 +982,7 @@ io.on("connection", (socket) => {
           state.redoStack = [];
         }
       }
+      appendRecordingEvent(state, `command:${command}`, socket.user.email, { snapshot: command === "snapshot" ? Boolean(snapshot) : false });
 
       whiteboardStates.set(chatId, state);
       queueWhiteboardPersist(chatId);
@@ -927,6 +1019,238 @@ io.on("connection", (socket) => {
       traceId,
     });
     endEvent("whiteboardCursor", startedAt, traceId);
+  });
+
+  socket.on("whiteboardPointer", (payload) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardPointer", traceId);
+    if (!payload || !payload.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    if (isRateLimited(socket, "whiteboardPointer", 90, 10000)) {
+      endEvent("whiteboardPointer", startedAt, traceId);
+      return;
+    }
+    socket.to(payload.chatId).emit("whiteboardPointer", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      senderName: payload.senderName,
+      point: payload.point,
+      color: payload.color || "#ef4444",
+      traceId,
+    });
+    endEvent("whiteboardPointer", startedAt, traceId);
+  });
+
+  socket.on("whiteboardPresence", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardPresence", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardPresence", startedAt, traceId);
+      return;
+    }
+    if (isRateLimited(socket, "whiteboardPresence", 60, 10000)) {
+      ackErr(ack, traceId, "RATE_LIMITED", "rate_limited");
+      endEvent("whiteboardPresence", startedAt, traceId);
+      return;
+    }
+    socket.to(payload.chatId).emit("whiteboardPresence", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      senderName: payload.senderName,
+      status: payload.status || "viewing",
+      traceId,
+    });
+    ackOk(ack, traceId);
+    endEvent("whiteboardPresence", startedAt, traceId);
+  });
+
+  socket.on("whiteboardControl", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardControl", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardControl", startedAt, traceId);
+      return;
+    }
+    const enqueued = enqueueChatTask(payload.chatId, async () => {
+      const state = await loadWhiteboardState(payload.chatId);
+      ensureSessionMeta(state, payload.chatId);
+      if (!canControlSession(state, socket.user.email)) return;
+      const action = payload.action || "";
+      const target = normalizeSessionEmail(payload.targetEmail);
+      if (action === "setRole" && target && (payload.role === "teacher" || payload.role === "learner")) {
+        state.sessionMeta[payload.role] = target;
+      } else if (action === "setPermission" && target) {
+        const current = state.sessionMeta.permissions[target] || defaultPermission(false);
+        state.sessionMeta.permissions[target] = {
+          ...current,
+          ...payload.permission,
+        };
+      } else if (action === "lockBoard") {
+        state.sessionMeta.boardLocked = Boolean(payload.locked);
+      } else if (action === "followMode") {
+        state.sessionMeta.followMode = Boolean(payload.enabled);
+      } else if (action === "kick" && target) {
+        io.to(payload.chatId).emit("whiteboardControl", {
+          chatId: payload.chatId,
+          action: "kicked",
+          targetEmail: target,
+          by: socket.user.email,
+          traceId,
+        });
+      } else if (action === "setTemplate") {
+        state.sessionMeta.activeTemplate = String(payload.template || "blank");
+      }
+      appendRecordingEvent(state, "control", socket.user.email, { action, target, payload });
+      whiteboardStates.set(payload.chatId, state);
+      queueWhiteboardPersist(payload.chatId);
+      io.to(payload.chatId).emit("whiteboardSession", {
+        chatId: payload.chatId,
+        sessionMeta: state.sessionMeta,
+        sender: socket.user.email,
+        traceId,
+      });
+    });
+    if (!enqueued) {
+      ackErr(ack, traceId, "OVERLOADED", "queue_overloaded");
+      endEvent("whiteboardControl", startedAt, traceId);
+      return;
+    }
+    ackOk(ack, traceId);
+    endEvent("whiteboardControl", startedAt, traceId);
+  });
+
+  socket.on("whiteboardAssetUpload", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardAssetUpload", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardAssetUpload", startedAt, traceId);
+      return;
+    }
+    const enqueued = enqueueChatTask(payload.chatId, async () => {
+      const state = await loadWhiteboardState(payload.chatId);
+      ensureSessionMeta(state, payload.chatId);
+      const asset = payload.asset || {};
+      const safeAsset = {
+        id: String(asset.id || `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`),
+        type: asset.type === "pdf-page" ? "pdf-page" : "image",
+        name: String(asset.name || ""),
+        mime: String(asset.mime || ""),
+        key: String(asset.data || ""),
+        page: Number(asset.page) || 1,
+        width: Number(asset.width) || 0,
+        height: Number(asset.height) || 0,
+        createdBy: socket.user.email,
+        createdAt: new Date(),
+      };
+      state.assets.push(safeAsset);
+      appendRecordingEvent(state, "asset:upload", socket.user.email, { assetId: safeAsset.id, type: safeAsset.type });
+      whiteboardStates.set(payload.chatId, state);
+      queueWhiteboardPersist(payload.chatId);
+      io.to(payload.chatId).emit("whiteboardAssetUpload", {
+        chatId: payload.chatId,
+        sender: socket.user.email,
+        asset: safeAsset,
+        traceId,
+      });
+    });
+    if (!enqueued) {
+      ackErr(ack, traceId, "OVERLOADED", "queue_overloaded");
+      endEvent("whiteboardAssetUpload", startedAt, traceId);
+      return;
+    }
+    ackOk(ack, traceId);
+    endEvent("whiteboardAssetUpload", startedAt, traceId);
+  });
+
+  socket.on("whiteboardAssetAnnotate", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardAssetAnnotate", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardAssetAnnotate", startedAt, traceId);
+      return;
+    }
+    socket.to(payload.chatId).emit("whiteboardAssetAnnotate", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      annotation: payload.annotation || {},
+      traceId,
+    });
+    ackOk(ack, traceId);
+    endEvent("whiteboardAssetAnnotate", startedAt, traceId);
+  });
+
+  socket.on("whiteboardRecording", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardRecording", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardRecording", startedAt, traceId);
+      return;
+    }
+    const enqueued = enqueueChatTask(payload.chatId, async () => {
+      const state = await loadWhiteboardState(payload.chatId);
+      ensureSessionMeta(state, payload.chatId);
+      if (!canControlSession(state, socket.user.email)) return;
+      const command = payload.command || "";
+      if (command === "start") {
+        state.sessionMeta.recordingActive = true;
+        state.sessionMeta.recordingStartedAt = new Date();
+        appendRecordingEvent(state, "recording:start", socket.user.email, {});
+      } else if (command === "stop") {
+        appendRecordingEvent(state, "recording:stop", socket.user.email, {});
+        state.sessionMeta.recordingActive = false;
+      } else if (command === "clear") {
+        state.recordingLog = [];
+      } else if (command === "save") {
+        appendRecordingEvent(state, "recording:save", socket.user.email, { total: state.recordingLog.length });
+      }
+      whiteboardStates.set(payload.chatId, state);
+      queueWhiteboardPersist(payload.chatId);
+      io.to(payload.chatId).emit("whiteboardRecording", {
+        chatId: payload.chatId,
+        sender: socket.user.email,
+        command,
+        sessionMeta: state.sessionMeta,
+        recordingLog: state.recordingLog,
+        traceId,
+      });
+    });
+    if (!enqueued) {
+      ackErr(ack, traceId, "OVERLOADED", "queue_overloaded");
+      endEvent("whiteboardRecording", startedAt, traceId);
+      return;
+    }
+    ackOk(ack, traceId);
+    endEvent("whiteboardRecording", startedAt, traceId);
+  });
+
+  socket.on("webrtcSignal", (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("webrtcSignal", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("webrtcSignal", startedAt, traceId);
+      return;
+    }
+    if (isRateLimited(socket, "webrtcSignal", 150, 10000)) {
+      ackErr(ack, traceId, "RATE_LIMITED", "rate_limited");
+      endEvent("webrtcSignal", startedAt, traceId);
+      return;
+    }
+    socket.to(payload.chatId).emit("webrtcSignal", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      senderName: payload.senderName,
+      signalType: payload.signalType,
+      signal: payload.signal,
+      muted: payload.muted,
+      traceId,
+    });
+    ackOk(ack, traceId);
+    endEvent("webrtcSignal", startedAt, traceId);
   });
 
   socket.on("whiteboardCursorLeave", (payload) => {

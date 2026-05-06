@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node sharik.js",
     "watch": "nodemon --ext *",
-    "loadtest:whiteboard": "node scripts/load-test-whiteboard.js"
+    "loadtest:whiteboard": "node scripts/load-test-whiteboard.js",
+    "test:whiteboard:readiness": "node scripts/test-whiteboard-readiness.js"
   },
   "keywords": [],
   "author": "",
