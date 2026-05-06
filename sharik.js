@@ -910,10 +910,16 @@ io.on("connection", (socket) => {
       endEvent("whiteboardAction", startedAt, traceId);
       return;
     }
+    const preState = await loadWhiteboardState(chatId);
+    ensureSessionMeta(preState, chatId);
+    if (!canUserDraw(preState, socket.user.email)) {
+      ackErr(ack, traceId, "DRAW_FORBIDDEN", "draw_forbidden");
+      endEvent("whiteboardAction", startedAt, traceId);
+      return;
+    }
     const enqueued = enqueueChatTask(chatId, async () => {
       const state = await loadWhiteboardState(chatId);
       ensureSessionMeta(state, chatId);
-      if (!canUserDraw(state, socket.user.email)) return;
       state.actions.push(safeAction);
       state.redoStack = [];
       appendRecordingEvent(state, "action", socket.user.email, { action: safeAction });
@@ -1037,6 +1043,15 @@ io.on("connection", (socket) => {
       color: payload.color || "#ef4444",
       traceId,
     });
+    enqueueChatTask(payload.chatId, async () => {
+      const state = await loadWhiteboardState(payload.chatId);
+      appendRecordingEvent(state, "pointer", socket.user.email, {
+        point: payload.point,
+        color: payload.color || "#ef4444",
+      });
+      whiteboardStates.set(payload.chatId, state);
+      queueWhiteboardPersist(payload.chatId);
+    });
     endEvent("whiteboardPointer", startedAt, traceId);
   });
 
@@ -1072,10 +1087,16 @@ io.on("connection", (socket) => {
       endEvent("whiteboardControl", startedAt, traceId);
       return;
     }
+    const preState = await loadWhiteboardState(payload.chatId);
+    ensureSessionMeta(preState, payload.chatId);
+    if (!canControlSession(preState, socket.user.email)) {
+      ackErr(ack, traceId, "CONTROL_FORBIDDEN", "control_forbidden");
+      endEvent("whiteboardControl", startedAt, traceId);
+      return;
+    }
     const enqueued = enqueueChatTask(payload.chatId, async () => {
       const state = await loadWhiteboardState(payload.chatId);
       ensureSessionMeta(state, payload.chatId);
-      if (!canControlSession(state, socket.user.email)) return;
       const action = payload.action || "";
       const target = normalizeSessionEmail(payload.targetEmail);
       if (action === "setRole" && target && (payload.role === "teacher" || payload.role === "learner")) {
@@ -1125,6 +1146,14 @@ io.on("connection", (socket) => {
     const startedAt = startEvent("whiteboardAssetUpload", traceId);
     if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
       ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardAssetUpload", startedAt, traceId);
+      return;
+    }
+    const preState = await loadWhiteboardState(payload.chatId);
+    ensureSessionMeta(preState, payload.chatId);
+    const uploadPerm = preState.sessionMeta.permissions?.[normalizeSessionEmail(socket.user.email)]?.canUpload;
+    if (uploadPerm === false && !canControlSession(preState, socket.user.email)) {
+      ackErr(ack, traceId, "UPLOAD_FORBIDDEN", "upload_forbidden");
       endEvent("whiteboardAssetUpload", startedAt, traceId);
       return;
     }
