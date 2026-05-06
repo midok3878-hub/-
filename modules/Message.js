@@ -6,6 +6,7 @@ const messageSchema = new Schema(
     chatId: { type: String, required: true, index: true },
     sender: { type: String, required: true },
     receiver: { type: String, required: true },
+    traceId: { type: String, default: "", index: true },
     text: { type: String, default: "" },
     attachments: [
       {
