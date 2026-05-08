@@ -1,10 +1,10 @@
 const express = require("express");
 
 process.on('uncaughtException', (err) => {
-    console.error('🚨 UNCAUGHT EXCEPTION:', err);
+  console.error('🚨 UNCAUGHT EXCEPTION:', err);
 });
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('🚨 UNHANDLED REJECTION:', reason);
+  console.error('🚨 UNHANDLED REJECTION:', reason);
 });
 
 const app = express();
@@ -339,13 +339,13 @@ async function loadWhiteboardState(chatId) {
   }
   const state = doc
     ? {
-        snapshot,
-        actions: doc.actions || [],
-        redoStack: doc.redoStack || [],
-        sessionMeta: doc.sessionMeta || {},
-        assets: doc.assets || [],
-        recordingLog: doc.recordingLog || [],
-      }
+      snapshot,
+      actions: doc.actions || [],
+      redoStack: doc.redoStack || [],
+      sessionMeta: doc.sessionMeta || {},
+      assets: doc.assets || [],
+      recordingLog: doc.recordingLog || [],
+    }
     : { snapshot: null, actions: [], redoStack: [], sessionMeta: {}, assets: [], recordingLog: [] };
   ensureSessionMeta(state, chatId);
   whiteboardStates.set(chatId, state);
@@ -371,10 +371,10 @@ function queueWhiteboardPersist(chatId) {
           lastActivity: new Date(),
           snapshot: state.snapshot
             ? {
-                mime: state.snapshot.mime || "image/jpeg",
-                key: snapshotKey,
-                updatedAt: state.snapshot.updatedAt || new Date(),
-              }
+              mime: state.snapshot.mime || "image/jpeg",
+              key: snapshotKey,
+              updatedAt: state.snapshot.updatedAt || new Date(),
+            }
             : { mime: "", key: "", updatedAt: null },
           actions: state.actions,
           redoStack: state.redoStack,
@@ -578,15 +578,15 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
     const matches = allUsers
       .filter((user) => {
         // يجب أن يمتلك المستخدم الآخر المهارة التي أريد تعلمها، وأن يكون قد اجتاز اختبارها
-        const canTeachMe = user.teachSkills.some((s) => 
+        const canTeachMe = user.teachSkills.some((s) =>
           currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)
         );
-        
+
         // يجب أن أمتلك أنا المهارة التي يريد المستخدم الآخر تعلمها، وأن أكون قد اجتزت اختبارها
-        const canLearnFrom = user.learnSkills.some((s) => 
+        const canLearnFrom = user.learnSkills.some((s) =>
           currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)
         );
-        
+
         // المطابقة تتم فقط إذا كان هناك تبادل منفعة (كل شخص يفيد الآخر)
         return canTeachMe && canLearnFrom;
       })
@@ -614,8 +614,24 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════
 app.get("/api/messages/:chatId", authMiddleware, async (req, res) => {
   try {
-    const messages = await Message.find({ chatId: req.params.chatId }).sort({ createdAt: 1 });
-    res.json({ messages });
+    const { before, limit } = req.query;
+    const cappedLimit = Math.max(1, Math.min(Number(limit) || 40, 100));
+    const filter = { chatId: req.params.chatId };
+    if (before) {
+      const beforeDate = new Date(before);
+      if (!Number.isNaN(beforeDate.getTime())) {
+        filter.createdAt = { $lt: beforeDate };
+      }
+    }
+    const rows = await Message.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(cappedLimit + 1)
+      .lean();
+    const hasMore = rows.length > cappedLimit;
+    const page = hasMore ? rows.slice(0, cappedLimit) : rows;
+    const messages = page.reverse();
+    const nextBefore = messages.length ? messages[0].createdAt : null;
+    res.json({ messages, hasMore, nextBefore });
   } catch (err) {
     res.status(500).json({ error: "خطأ في جلب الرسائل" });
   }
@@ -623,21 +639,27 @@ app.get("/api/messages/:chatId", authMiddleware, async (req, res) => {
 
 app.post("/api/messages", authMiddleware, async (req, res) => {
   try {
-    const { chatId, receiver, text, attachments } = req.body;
+    const { chatId, receiver, text, attachments, messageId } = req.body;
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
+    if (!messageId || typeof messageId !== "string") {
+      return res.status(400).json({ error: "messageId مطلوب" });
+    }
 
-    const message = new Message({
-      chatId,
-      sender: user.email,
-      receiver,
-      text: text || "",
-      attachments: attachments || [],
-    });
-    await message.save();
-
-    // Emit via socket
-    io.to(chatId).emit("newMessage", message);
+    let message = await Message.findOne({ chatId, messageId });
+    if (!message) {
+      message = new Message({
+        chatId,
+        messageId,
+        sender: user.email,
+        receiver,
+        text: text || "",
+        attachments: attachments || [],
+      });
+      await message.save();
+      // Emit only on first creation
+      io.to(chatId).emit("newMessage", message);
+    }
 
     res.status(201).json({ message });
   } catch (err) {
@@ -718,7 +740,7 @@ app.post("/api/connections/delete", authMiddleware, async (req, res) => {
     await User.findByIdAndUpdate(req.userId, {
       $addToSet: { deletedConnections: email }
     });
-    
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "خطأ في حذف الاتصال" });
@@ -884,17 +906,29 @@ io.on("connection", (socket) => {
         endEvent("sendMessage", startedAt, traceId);
         return;
       }
-      const message = new Message({
+      if (!data.messageId || typeof data.messageId !== "string") {
+        ackErr(ack, traceId, "INVALID_MESSAGE_ID", "invalid_message_id");
+        endEvent("sendMessage", startedAt, traceId);
+        return;
+      }
+      let message = await Message.findOne({
         chatId: data.chatId,
-        sender: socket.user.email,
-        receiver: data.receiver,
-        text: data.text || "",
-        attachments: data.attachments || [],
-        traceId,
+        messageId: data.messageId,
       });
-      await message.save();
-      io.to(data.chatId).emit("newMessage", message);
-      ackOk(ack, traceId);
+      if (!message) {
+        message = new Message({
+          chatId: data.chatId,
+          messageId: data.messageId,
+          sender: socket.user.email,
+          receiver: data.receiver,
+          text: data.text || "",
+          attachments: data.attachments || [],
+          traceId,
+        });
+        await message.save();
+        io.to(data.chatId).emit("newMessage", message);
+      }
+      ackOk(ack, traceId, { message });
       endEvent("sendMessage", startedAt, traceId);
     } catch (err) {
       console.log("Socket message error:", err);
@@ -1294,10 +1328,21 @@ io.on("connection", (socket) => {
         page: Number(asset.page) || 1,
         width: Number(asset.width) || 0,
         height: Number(asset.height) || 0,
+        x: Number(asset.x) || 0,
+        y: Number(asset.y) || 0,
+        rotation: Number(asset.rotation) || 0,
+        scaleX: Number(asset.scaleX) || 1,
+        scaleY: Number(asset.scaleY) || 1,
+        z: Number(asset.z) || 1,
+        version: Number(asset.version) || 1,
         createdBy: socket.user.email,
         createdAt: new Date(),
+        updatedAt: new Date(),
+        deletedAt: null,
       };
-      state.assets.push(safeAsset);
+      const existingIdx = state.assets.findIndex((a) => a.id === safeAsset.id);
+      if (existingIdx >= 0) state.assets[existingIdx] = { ...state.assets[existingIdx], ...safeAsset };
+      else state.assets.push(safeAsset);
       appendRecordingEvent(state, "asset:upload", socket.user.email, { assetId: safeAsset.id, type: safeAsset.type });
       whiteboardStates.set(payload.chatId, state);
       queueWhiteboardPersist(payload.chatId);
@@ -1333,6 +1378,83 @@ io.on("connection", (socket) => {
     });
     ackOk(ack, traceId);
     endEvent("whiteboardAssetAnnotate", startedAt, traceId);
+  });
+
+  socket.on("whiteboardAssetUpdate", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardAssetUpdate", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardAssetUpdate", startedAt, traceId);
+      return;
+    }
+    const enqueued = enqueueChatTask(payload.chatId, async () => {
+      const state = await loadWhiteboardState(payload.chatId);
+      ensureSessionMeta(state, payload.chatId);
+      const idx = state.assets.findIndex((a) => a.id === payload.assetId && !a.deletedAt);
+      if (idx < 0) return;
+      const current = state.assets[idx];
+      const incomingVersion = Number(payload.version) || current.version + 1;
+      if (incomingVersion <= Number(current.version || 0)) return;
+      state.assets[idx] = {
+        ...current,
+        x: Number(payload.x ?? current.x) || 0,
+        y: Number(payload.y ?? current.y) || 0,
+        width: Number(payload.width ?? current.width) || 0,
+        height: Number(payload.height ?? current.height) || 0,
+        rotation: Number(payload.rotation ?? current.rotation) || 0,
+        scaleX: Number(payload.scaleX ?? current.scaleX) || 1,
+        scaleY: Number(payload.scaleY ?? current.scaleY) || 1,
+        z: Number(payload.z ?? current.z) || 1,
+        version: incomingVersion,
+        updatedAt: new Date(),
+      };
+      whiteboardStates.set(payload.chatId, state);
+      queueWhiteboardPersist(payload.chatId);
+      io.to(payload.chatId).emit("whiteboardAssetUpdate", {
+        chatId: payload.chatId,
+        asset: state.assets[idx],
+        traceId,
+      });
+    });
+    if (!enqueued) {
+      ackErr(ack, traceId, "OVERLOADED", "queue_overloaded");
+      endEvent("whiteboardAssetUpdate", startedAt, traceId);
+      return;
+    }
+    ackOk(ack, traceId);
+    endEvent("whiteboardAssetUpdate", startedAt, traceId);
+  });
+
+  socket.on("whiteboardAssetDelete", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    const startedAt = startEvent("whiteboardAssetDelete", traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) {
+      ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("whiteboardAssetDelete", startedAt, traceId);
+      return;
+    }
+    const enqueued = enqueueChatTask(payload.chatId, async () => {
+      const state = await loadWhiteboardState(payload.chatId);
+      ensureSessionMeta(state, payload.chatId);
+      state.assets = state.assets.map((asset) =>
+        asset.id === payload.assetId ? { ...asset, deletedAt: new Date(), version: Number(asset.version || 1) + 1 } : asset
+      );
+      whiteboardStates.set(payload.chatId, state);
+      queueWhiteboardPersist(payload.chatId);
+      io.to(payload.chatId).emit("whiteboardAssetDelete", {
+        chatId: payload.chatId,
+        assetId: payload.assetId,
+        traceId,
+      });
+    });
+    if (!enqueued) {
+      ackErr(ack, traceId, "OVERLOADED", "queue_overloaded");
+      endEvent("whiteboardAssetDelete", startedAt, traceId);
+      return;
+    }
+    ackOk(ack, traceId);
+    endEvent("whiteboardAssetDelete", startedAt, traceId);
   });
 
   socket.on("whiteboardRecording", async (payload, ack) => {
