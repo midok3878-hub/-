@@ -53,6 +53,7 @@ const User = require("./modules/User");
 const Message = require("./modules/Message");
 const WhiteboardState = require("./modules/WhiteboardState");
 const Article = require("./modules/myData");
+const Match = require("./modules/Match");
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
@@ -561,51 +562,197 @@ app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════
 // 4) MATCHING API
 // ═══════════════════════════════════════════════
+
+// Calculate shared skills score between two users
+function calcMatchScore(currentUser, otherUser) {
+  const sharedLearn = otherUser.teachSkills.filter((s) =>
+    currentUser.learnSkills.includes(s)
+  ).length;
+  const sharedTeach = otherUser.learnSkills.filter((s) =>
+    currentUser.teachSkills.includes(s)
+  ).length;
+  const total = (currentUser.learnSkills.length + currentUser.teachSkills.length) || 1;
+  return Math.min(100, Math.round(((sharedLearn + sharedTeach) / total) * 100));
+}
+
+// GET /api/matches — returns real users sorted by skill overlap
 app.get("/api/matches", authMiddleware, async (req, res) => {
   try {
     const currentUser = await User.findById(req.userId);
-    if (!currentUser || !currentUser.learnSkills.length || !currentUser.teachSkills.length) {
-      return res.json({ matches: [] });
-    }
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
 
+    const mySkills = [...(currentUser.learnSkills || []), ...(currentUser.teachSkills || [])];
+    if (mySkills.length === 0) return res.json({ matches: [] });
+
+    // Fetch all users who have at least one skill set
     const allUsers = await User.find({
       _id: { $ne: currentUser._id },
-      learnSkills: { $exists: true, $ne: [] },
-      teachSkills: { $exists: true, $ne: [] },
-      verifiedSkills: { $exists: true, $ne: [] },
+      $or: [
+        { learnSkills: { $exists: true, $not: { $size: 0 } } },
+        { teachSkills: { $exists: true, $not: { $size: 0 } } },
+      ],
     });
 
-    const matches = allUsers
-      .filter((user) => {
-        // يجب أن يمتلك المستخدم الآخر المهارة التي أريد تعلمها، وأن يكون قد اجتاز اختبارها
-        const canTeachMe = user.teachSkills.some((s) =>
-          currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)
-        );
+    // Fetch all existing match records for current user
+    const existingMatches = await Match.find({
+      $or: [{ userA: currentUser.email }, { userB: currentUser.email }],
+    });
+    const matchMap = {};
+    existingMatches.forEach((m) => {
+      const peer = m.userA === currentUser.email ? m.userB : m.userA;
+      matchMap[peer] = m;
+    });
 
-        // يجب أن أمتلك أنا المهارة التي يريد المستخدم الآخر تعلمها، وأن أكون قد اجتزت اختبارها
-        const canLearnFrom = user.learnSkills.some((s) =>
-          currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)
-        );
-
-        // المطابقة تتم فقط إذا كان هناك تبادل منفعة (كل شخص يفيد الآخر)
-        return canTeachMe && canLearnFrom;
-      })
+    const results = allUsers
       .map((user) => {
-        const learnM = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)).length;
-        const teachM = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)).length;
-        const total = currentUser.learnSkills.length + currentUser.teachSkills.length || 1;
-        const matchScore = Math.round(((learnM + teachM) / total) * 100);
+        const score = calcMatchScore(currentUser, user);
         const safe = user.toSafeObject();
-        safe.name = safe.username1 + " " + safe.username2;
-        safe.matchScore = matchScore;
+        safe.name = (safe.username1 || "") + " " + (safe.username2 || "");
+        safe.matchScore = score;
+        // Attach match status
+        const existingMatch = matchMap[user.email];
+        safe.matchStatus = existingMatch ? existingMatch.status : null;
+        safe.matchInitiator = existingMatch ? existingMatch.initiator : null;
+        safe.chatId = existingMatch && existingMatch.status === "accepted" ? existingMatch.chatId : null;
+        safe._matchId = existingMatch ? String(existingMatch._id) : null;
         return safe;
       })
+      .filter((u) => u.matchScore > 0)
       .sort((a, b) => b.matchScore - a.matchScore);
 
-    res.json({ matches });
+    res.json({ matches: results });
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "خطأ في البحث عن شركاء" });
+  }
+});
+
+// POST /api/match/request — send match request
+app.post("/api/match/request", authMiddleware, async (req, res) => {
+  try {
+    const { targetEmail } = req.body;
+    if (!targetEmail) return res.status(400).json({ error: "البريد الإلكتروني مطلوب" });
+
+    const currentUser = await User.findById(req.userId);
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+    const targetUser = await User.findOne({ email: targetEmail.toLowerCase().trim() });
+    if (!targetUser) return res.status(404).json({ error: "المستخدم غير موجود" });
+
+    if (currentUser.email === targetUser.email)
+      return res.status(400).json({ error: "لا يمكنك مطابقة نفسك" });
+
+    const [userA, userB] = Match.makePair(currentUser.email, targetUser.email);
+
+    let match = await Match.findOne({ userA, userB });
+    if (match) {
+      return res.json({ match, alreadyExists: true });
+    }
+
+    match = new Match({ userA, userB, initiator: currentUser.email, status: "pending" });
+    await match.save();
+
+    // Notify target via Socket.IO if connected
+    io.to(`user:${targetUser.email}`).emit("matchRequest", {
+      from: currentUser.email,
+      fromName: currentUser.username1 + " " + currentUser.username2,
+      matchId: match._id,
+    });
+
+    res.status(201).json({ match });
+  } catch (err) {
+    if (err.code === 11000) {
+      const [userA, userB] = Match.makePair(
+        (await User.findById(req.userId))?.email || "",
+        req.body.targetEmail
+      );
+      const match = await Match.findOne({ userA, userB });
+      return res.json({ match, alreadyExists: true });
+    }
+    console.log(err);
+    res.status(500).json({ error: "خطأ في إرسال طلب المطابقة" });
+  }
+});
+
+// POST /api/match/respond — accept or reject
+app.post("/api/match/respond", authMiddleware, async (req, res) => {
+  try {
+    const { matchId, action } = req.body; // action: "accept" | "reject"
+    if (!matchId || !action) return res.status(400).json({ error: "بيانات ناقصة" });
+
+    const currentUser = await User.findById(req.userId);
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+    const match = await Match.findById(matchId);
+    if (!match) return res.status(404).json({ error: "طلب المطابقة غير موجود" });
+
+    // Only the non-initiator can respond
+    if (match.initiator === currentUser.email)
+      return res.status(403).json({ error: "لا يمكنك الرد على طلبك الخاص" });
+    if (match.userA !== currentUser.email && match.userB !== currentUser.email)
+      return res.status(403).json({ error: "غير مصرح لك بالرد" });
+
+    if (action === "accept") {
+      match.status = "accepted";
+      match.chatId = Match.buildChatId(match.userA, match.userB);
+    } else {
+      match.status = "rejected";
+    }
+    await match.save();
+
+    // Notify initiator via Socket.IO
+    io.to(`user:${match.initiator}`).emit("matchResponded", {
+      status: match.status,
+      chatId: match.chatId,
+      by: currentUser.email,
+    });
+
+    res.json({ match });
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "خطأ في الرد على طلب المطابقة" });
+  }
+});
+
+// GET /api/match/status/:email — check match status with specific user
+app.get("/api/match/status/:email", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.userId);
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
+    const match = await Match.findBetween(currentUser.email, req.params.email);
+    res.json({ match: match || null });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب حالة المطابقة" });
+  }
+});
+
+// GET /api/my-matches — get all accepted matches for current user
+app.get("/api/my-matches", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.userId);
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
+    const matches = await Match.find({
+      $or: [{ userA: currentUser.email }, { userB: currentUser.email }],
+      status: "accepted",
+    });
+    res.json({ matches });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب المطابقات" });
+  }
+});
+
+// GET /api/pending-requests — get pending match requests for current user
+app.get("/api/pending-requests", authMiddleware, async (req, res) => {
+  try {
+    const currentUser = await User.findById(req.userId);
+    if (!currentUser) return res.status(404).json({ error: "مستخدم غير موجود" });
+    const pending = await Match.find({
+      $or: [{ userA: currentUser.email }, { userB: currentUser.email }],
+      status: "pending",
+    });
+    res.json({ pending });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب الطلبات" });
   }
 });
 
@@ -646,6 +793,14 @@ app.post("/api/messages", authMiddleware, async (req, res) => {
       return res.status(400).json({ error: "messageId مطلوب" });
     }
 
+    // ── Security: verify accepted match exists ──
+    if (receiver) {
+      const existingMatch = await Match.findBetween(user.email, receiver);
+      if (!existingMatch || existingMatch.status !== "accepted") {
+        return res.status(403).json({ error: "لا يمكنك المراسلة قبل قبول المطابقة" });
+      }
+    }
+
     let message = await Message.findOne({ chatId, messageId });
     if (!message) {
       message = new Message({
@@ -657,7 +812,6 @@ app.post("/api/messages", authMiddleware, async (req, res) => {
         attachments: attachments || [],
       });
       await message.save();
-      // Emit only on first creation
       io.to(chatId).emit("newMessage", message);
     }
 
@@ -846,6 +1000,11 @@ io.on("connection", (socket) => {
     traceId: socket.data.connectionTraceId,
   });
 
+  // Join personal room for notifications (matchRequest, matchResponded)
+  if (socket.user?.email) {
+    socket.join(`user:${socket.user.email}`);
+  }
+
   const ackOk = (ack, traceId, payload = {}) => {
     if (typeof ack === "function") ack({ ok: true, traceId, ...payload });
   };
@@ -911,6 +1070,17 @@ io.on("connection", (socket) => {
         endEvent("sendMessage", startedAt, traceId);
         return;
       }
+
+      // Security: verify both users have an accepted match
+      if (data.receiver) {
+        const existingMatch = await Match.findBetween(socket.user.email, data.receiver);
+        if (!existingMatch || existingMatch.status !== "accepted") {
+          ackErr(ack, traceId, "NO_MATCH", "لا يمكنك المراسلة قبل قبول المطابقة");
+          endEvent("sendMessage", startedAt, traceId);
+          return;
+        }
+      }
+
       let message = await Message.findOne({
         chatId: data.chatId,
         messageId: data.messageId,
