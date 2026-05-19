@@ -17,7 +17,7 @@ const userSchema = new Schema(
     learnSkills: { type: [String], default: [] },
     teachSkills: { type: [String], default: [] },
     verifiedSkills: { type: [String], default: [] },
-    avatar: { type: String, default: "" }, // base64 or URL
+    avatar: { type: String, default: "" }, 
     skillTestResults: {
       type: Map,
       of: {

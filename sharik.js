@@ -1,10 +1,10 @@
 const express = require("express");
 
 process.on('uncaughtException', (err) => {
-  console.error('🚨 UNCAUGHT EXCEPTION:', err);
+  console.error(' UNCAUGHT EXCEPTION:', err);
 });
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('🚨 UNHANDLED REJECTION:', reason);
+  console.error(' UNHANDLED REJECTION:', reason);
 });
 
 const app = express();
