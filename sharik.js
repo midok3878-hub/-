@@ -1577,7 +1577,7 @@ io.on("connection", (socket) => {
   });
 
   // ─────────────────────────────────────────────────────────
-  // 💻 Code Editor — Real-Time Collaborative Handlers
+  // 💻 Code Editor — Real-Time Collaborative Handlers (v5)
   // ─────────────────────────────────────────────────────────
 
   socket.on("codeEditorJoin", (payload, ack) => {
@@ -1597,54 +1597,35 @@ io.on("connection", (socket) => {
     if (typeof ack === "function") ack({ ok: true });
   });
 
-  socket.on("codeEditorOp", (payload, ack) => {
+  // Full-content sync (replaces OT-based codeEditorOp)
+  socket.on("codeEditorSync", (payload, ack) => {
     const chatId = payload?.chatId;
     if (!chatId || !ensureJoined(socket, chatId) || !canAccessChat(socket, chatId)) return;
-    if (isRateLimited(socket, "codeEditorOp", 300, 10000)) return;
+    if (isRateLimited(socket, "codeEditorSync", 300, 10000)) return;
 
-    const op = payload?.op;
-    if (!op || !Array.isArray(op.components)) return;
+    const content = payload?.content;
+    if (typeof content !== "string" || content.length > 500000) return;
 
-    // Sanitize components
-    const safeComponents = [];
-    for (const comp of op.components) {
-      if (comp.r != null && Number.isInteger(comp.r) && comp.r > 0 && comp.r <= 500000) {
-        safeComponents.push({ r: comp.r });
-      } else if (comp.i != null && typeof comp.i === "string" && comp.i.length <= 10000) {
-        safeComponents.push({ i: comp.i });
-      } else if (comp.d != null && Number.isInteger(comp.d) && comp.d > 0 && comp.d <= 500000) {
-        safeComponents.push({ d: comp.d });
-      }
-    }
-    if (safeComponents.length === 0) return;
+    const state = getCodeEditorState(chatId);
+    const incomingRev = Number(payload.revision) || 0;
 
-    const safeOp = { components: safeComponents };
+    // Always accept — last writer wins (safe for 2-user)
+    state.content  = content;
+    state.language = payload.language || state.language;
+    state.revision = Math.max(state.revision, incomingRev);
+    state.updatedAt = Date.now();
 
-    enqueueChatTask(chatId, async () => {
-      const state = getCodeEditorState(chatId);
-      try {
-        const next = applyCodeOp(state.content, safeOp);
-        state.content = next;
-        state.revision += 1;
-        state.updatedAt = Date.now();
-      } catch (_) {
-        // op failed – skip, state unchanged
-        return;
-      }
-
-      const outPayload = {
-        chatId,
-        op: safeOp,
-        revision: state.revision,
-        sender: socket.user.email,
-        traceId: payload.traceId || "",
-      };
-
-      // Broadcast to peer (not sender)
-      socket.to(chatId).emit("codeEditorOp", outPayload);
-      // Ack sender with new revision
-      if (typeof ack === "function") ack({ ok: true, revision: state.revision });
+    // Broadcast full content to peer only (not sender)
+    socket.to(chatId).emit("codeEditorSync", {
+      chatId,
+      content,
+      language: state.language,
+      revision: state.revision,
+      sender: socket.user.email,
+      traceId: payload.traceId || "",
     });
+
+    if (typeof ack === "function") ack({ ok: true, revision: state.revision });
   });
 
   socket.on("codeEditorSave", (payload, ack) => {
@@ -1655,21 +1636,18 @@ io.on("connection", (socket) => {
     const content = payload?.content;
     if (typeof content !== "string" || content.length > 500000) return;
 
-    enqueueChatTask(chatId, async () => {
-      const state = getCodeEditorState(chatId);
-      // Only accept if content matches latest or sender has higher revision
-      const incomingRev = Number(payload.revision) || 0;
-      if (incomingRev >= state.revision) {
-        state.content = content;
-        state.revision = Math.max(state.revision, incomingRev);
-        state.language = payload.language || state.language;
-        state.updatedAt = Date.now();
-      }
-      io.to(chatId).emit("codeEditorSaved", {
-        chatId,
-        revision: state.revision,
-        savedBy: socket.user.email,
-      });
+    const state = getCodeEditorState(chatId);
+    const incomingRev = Number(payload.revision) || 0;
+    if (incomingRev >= state.revision) {
+      state.content  = content;
+      state.revision = Math.max(state.revision, incomingRev);
+      state.language = payload.language || state.language;
+      state.updatedAt = Date.now();
+    }
+    io.to(chatId).emit("codeEditorSaved", {
+      chatId,
+      revision: state.revision,
+      savedBy: socket.user.email,
     });
     if (typeof ack === "function") ack({ ok: true });
   });
@@ -1696,7 +1674,7 @@ io.on("connection", (socket) => {
       sender: socket.user.email,
       position: {
         lineNumber: Math.max(1, Math.floor(pos.lineNumber)),
-        column: Math.max(1, Math.floor(pos.column)),
+        column:     Math.max(1, Math.floor(pos.column)),
       },
     });
   });
@@ -1711,10 +1689,8 @@ io.on("connection", (socket) => {
     ]);
     const lang = String(payload?.language || "javascript");
     if (!ALLOWED_LANGS.has(lang)) return;
-
     const state = getCodeEditorState(chatId);
     state.language = lang;
-
     socket.to(chatId).emit("codeEditorLanguage", {
       chatId,
       sender: socket.user.email,
