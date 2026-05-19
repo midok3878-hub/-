@@ -23,6 +23,42 @@ const io = new Server(server, {
 });
 const whiteboardStates = new Map();
 const whiteboardPersistTimers = new Map();
+
+// ═══════════════════════════════════════════════
+// Code Editor — in-memory state per chatId
+// ═══════════════════════════════════════════════
+const codeEditorStates = new Map(); // chatId → { content, language, revision, updatedAt }
+
+function getCodeEditorState(chatId) {
+  if (!codeEditorStates.has(chatId)) {
+    codeEditorStates.set(chatId, {
+      content: '// ابدأ الكتابة...\n',
+      language: 'javascript',
+      revision: 0,
+      updatedAt: Date.now(),
+    });
+  }
+  return codeEditorStates.get(chatId);
+}
+
+function applyCodeOp(text, op) {
+  if (!op || !Array.isArray(op.components)) return text;
+  let result = '';
+  let pos = 0;
+  for (const comp of op.components) {
+    if (comp.r != null) {
+      const end = Math.min(pos + comp.r, text.length);
+      result += text.slice(pos, end);
+      pos = end;
+    } else if (comp.i != null) {
+      result += String(comp.i);
+    } else if (comp.d != null) {
+      pos = Math.min(pos + comp.d, text.length);
+    }
+  }
+  result += text.slice(pos);
+  return result;
+}
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
@@ -1540,15 +1576,171 @@ io.on("connection", (socket) => {
     endEvent("whiteboardCursorLeave", startedAt, traceId);
   });
 
+  // ─────────────────────────────────────────────────────────
+  // 💻 Code Editor — Real-Time Collaborative Handlers
+  // ─────────────────────────────────────────────────────────
+
+  socket.on("codeEditorJoin", (payload, ack) => {
+    const chatId = payload?.chatId;
+    if (!chatId || !canAccessChat(socket, chatId)) return;
+    if (!ensureJoined(socket, chatId)) return;
+    if (isRateLimited(socket, "codeEditorJoin", 10, 15000)) return;
+
+    const state = getCodeEditorState(chatId);
+    socket.emit("codeEditorState", {
+      chatId,
+      content: state.content,
+      language: state.language,
+      revision: state.revision,
+    });
+    structuredLog("codeEditor.join", { chatId, user: socket.user?.email });
+    if (typeof ack === "function") ack({ ok: true });
+  });
+
+  socket.on("codeEditorOp", (payload, ack) => {
+    const chatId = payload?.chatId;
+    if (!chatId || !ensureJoined(socket, chatId) || !canAccessChat(socket, chatId)) return;
+    if (isRateLimited(socket, "codeEditorOp", 300, 10000)) return;
+
+    const op = payload?.op;
+    if (!op || !Array.isArray(op.components)) return;
+
+    // Sanitize components
+    const safeComponents = [];
+    for (const comp of op.components) {
+      if (comp.r != null && Number.isInteger(comp.r) && comp.r > 0 && comp.r <= 500000) {
+        safeComponents.push({ r: comp.r });
+      } else if (comp.i != null && typeof comp.i === "string" && comp.i.length <= 10000) {
+        safeComponents.push({ i: comp.i });
+      } else if (comp.d != null && Number.isInteger(comp.d) && comp.d > 0 && comp.d <= 500000) {
+        safeComponents.push({ d: comp.d });
+      }
+    }
+    if (safeComponents.length === 0) return;
+
+    const safeOp = { components: safeComponents };
+
+    enqueueChatTask(chatId, async () => {
+      const state = getCodeEditorState(chatId);
+      try {
+        const next = applyCodeOp(state.content, safeOp);
+        state.content = next;
+        state.revision += 1;
+        state.updatedAt = Date.now();
+      } catch (_) {
+        // op failed – skip, state unchanged
+        return;
+      }
+
+      const outPayload = {
+        chatId,
+        op: safeOp,
+        revision: state.revision,
+        sender: socket.user.email,
+        traceId: payload.traceId || "",
+      };
+
+      // Broadcast to peer (not sender)
+      socket.to(chatId).emit("codeEditorOp", outPayload);
+      // Ack sender with new revision
+      if (typeof ack === "function") ack({ ok: true, revision: state.revision });
+    });
+  });
+
+  socket.on("codeEditorSave", (payload, ack) => {
+    const chatId = payload?.chatId;
+    if (!chatId || !ensureJoined(socket, chatId) || !canAccessChat(socket, chatId)) return;
+    if (isRateLimited(socket, "codeEditorSave", 20, 10000)) return;
+
+    const content = payload?.content;
+    if (typeof content !== "string" || content.length > 500000) return;
+
+    enqueueChatTask(chatId, async () => {
+      const state = getCodeEditorState(chatId);
+      // Only accept if content matches latest or sender has higher revision
+      const incomingRev = Number(payload.revision) || 0;
+      if (incomingRev >= state.revision) {
+        state.content = content;
+        state.revision = Math.max(state.revision, incomingRev);
+        state.language = payload.language || state.language;
+        state.updatedAt = Date.now();
+      }
+      io.to(chatId).emit("codeEditorSaved", {
+        chatId,
+        revision: state.revision,
+        savedBy: socket.user.email,
+      });
+    });
+    if (typeof ack === "function") ack({ ok: true });
+  });
+
+  socket.on("codeEditorTyping", (payload) => {
+    const chatId = payload?.chatId;
+    if (!chatId || !ensureJoined(socket, chatId) || !canAccessChat(socket, chatId)) return;
+    if (isRateLimited(socket, "codeEditorTyping", 60, 10000)) return;
+    socket.to(chatId).emit("codeEditorTyping", {
+      chatId,
+      sender: socket.user.email,
+      typing: Boolean(payload.typing),
+    });
+  });
+
+  socket.on("codeEditorCursor", (payload) => {
+    const chatId = payload?.chatId;
+    if (!chatId || !ensureJoined(socket, chatId) || !canAccessChat(socket, chatId)) return;
+    if (isRateLimited(socket, "codeEditorCursor", 120, 10000)) return;
+    const pos = payload?.position;
+    if (!pos || typeof pos.lineNumber !== "number" || typeof pos.column !== "number") return;
+    socket.to(chatId).emit("codeEditorCursor", {
+      chatId,
+      sender: socket.user.email,
+      position: {
+        lineNumber: Math.max(1, Math.floor(pos.lineNumber)),
+        column: Math.max(1, Math.floor(pos.column)),
+      },
+    });
+  });
+
+  socket.on("codeEditorLanguage", (payload) => {
+    const chatId = payload?.chatId;
+    if (!chatId || !ensureJoined(socket, chatId) || !canAccessChat(socket, chatId)) return;
+    if (isRateLimited(socket, "codeEditorLanguage", 10, 15000)) return;
+    const ALLOWED_LANGS = new Set([
+      "javascript","typescript","python","html","css","java","cpp","c","csharp",
+      "go","rust","php","ruby","swift","kotlin","sql","json","xml","yaml","markdown","shell","plaintext"
+    ]);
+    const lang = String(payload?.language || "javascript");
+    if (!ALLOWED_LANGS.has(lang)) return;
+
+    const state = getCodeEditorState(chatId);
+    state.language = lang;
+
+    socket.to(chatId).emit("codeEditorLanguage", {
+      chatId,
+      sender: socket.user.email,
+      language: lang,
+    });
+  });
+
+  socket.on("codeEditorLeave", (payload) => {
+    const chatId = payload?.chatId;
+    if (!chatId) return;
+    socket.to(chatId).emit("codeEditorTyping", { chatId, sender: socket.user?.email, typing: false });
+  });
+
+  // ─────────────────────────────────────────────────────────
+
   socket.on("disconnect", () => {
     if (socket.data.joinedChats && socket.user?.email) {
       socket.data.joinedChats.forEach((chatId) => {
         socket.to(chatId).emit("whiteboardCursorLeave", { chatId, sender: socket.user.email });
+        socket.to(chatId).emit("codeEditorTyping", { chatId, sender: socket.user.email, typing: false });
       });
     }
     console.log("🔴 User disconnected:", socket.id);
   });
 });
+
 
 // ═══════════════════════════════════════════════
 // MongoDB Connection & Server Start
